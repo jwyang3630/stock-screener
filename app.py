@@ -31,15 +31,26 @@ def fmp_get(path, symbol, key, extra=None):
     params = {"symbol": symbol, "apikey": key}
     if extra:
         params.update(extra)
-    r = requests.get(f"{BASE}/{path}", params=params, timeout=20)
+    # 주의: requests 예외 메시지에는 URL(=API 키)이 들어가므로 절대 그대로 화면에 내보내지 않습니다.
+    try:
+        r = requests.get(f"{BASE}/{path}", params=params, timeout=20)
+    except requests.RequestException:
+        raise FMPError("네트워크 오류가 발생했습니다. 잠시 후 다시 시도하세요.")
+    if r.status_code == 402:
+        raise FMPError("이 종목은 무료 플랜에서 제공되지 않습니다 (유료 플랜 전용 종목)")
     if r.status_code in (401, 403):
         raise FMPError(f"API 키가 잘못됐거나 '{path}' 항목이 무료 플랜에서 제공되지 않습니다 (HTTP {r.status_code})")
     if r.status_code == 429:
         raise FMPError("호출 한도를 초과했습니다. 잠시 후 또는 내일 다시 시도하세요.")
-    r.raise_for_status()
-    data = r.json()
+    if r.status_code >= 400:
+        raise FMPError(f"FMP 서버 오류 (HTTP {r.status_code})")
+    try:
+        data = r.json()
+    except ValueError:
+        raise FMPError("FMP 응답을 읽을 수 없습니다")
     if isinstance(data, dict) and ("Error Message" in data or "message" in data):
-        raise FMPError(str(data.get("Error Message") or data.get("message")))
+        msg = str(data.get("Error Message") or data.get("message")).replace(key, "***")
+        raise FMPError(msg)
     return data
 
 
@@ -209,7 +220,7 @@ if st.button("분석 시작", type="primary"):
             if "한도" in str(e):
                 break
         except Exception as e:
-            errors[sym] = f"오류: {e}"
+            errors[sym] = f"오류: {e}".replace(api_key, "***")
         bar.progress((idx + 1) / len(symbols))
     bar.empty()
 
