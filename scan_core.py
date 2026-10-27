@@ -29,6 +29,7 @@ FLOW_TAGS = {
     "ni": ["NetIncomeLoss", "ProfitLoss"],
     "cfo": ["NetCashProvidedByUsedInOperatingActivities"],
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"],
+    "sbc": ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"],  # 주식 보상 비용(현금 아님, FCF에서 차감해 보수적으로 봄)
 }
 # 재무상태표(시점, qtrs=0) 항목
 INSTANT_TAGS = {
@@ -201,6 +202,7 @@ def extract_quarter(zip_path, forms=("10-K",)):
     cur_flow = num[(num["ddate"] == num["period"]) & (num["qtrs"] == 4)]
     days_back = (num["period"] - num["ddate"]).dt.days
     prior_flow = num[(num["qtrs"] == 4) & days_back.between(345, 385)]
+    prior2_flow = num[(num["qtrs"] == 4) & days_back.between(710, 750)]
     cur_inst = num[(num["ddate"] == num["period"]) & (num["qtrs"] == 0)]
 
     res = pd.DataFrame(index=sub["adsh"].values)
@@ -208,6 +210,10 @@ def extract_quarter(zip_path, forms=("10-K",)):
         res[k] = _series_for(cur_flow, tags)
     res["revp"] = _series_for(prior_flow, FLOW_TAGS["rev"])
     res["nip"] = _series_for(prior_flow, FLOW_TAGS["ni"])
+    # 3년 평균용: 1년 전(…1), 2년 전(…2) 값. 소규모 기업은 2년치만 공시해 비어 있을 수 있음
+    for k in ("ebit", "cfo", "capex"):
+        res[k + "1"] = _series_for(prior_flow, FLOW_TAGS[k])
+        res[k + "2"] = _series_for(prior2_flow, FLOW_TAGS[k])
     inst = {k: _series_for(cur_inst, tags) for k, tags in INSTANT_TAGS.items()}
     res["equity"] = inst["equity"]
     res["cash"] = inst["cash_a"].reindex(res.index).fillna(0) + inst["sti"].reindex(res.index).fillna(0)
@@ -218,13 +224,15 @@ def extract_quarter(zip_path, forms=("10-K",)):
     cover = _cover_shares(sh_parts).reindex(res.index)
     wa = _wa_shares(sh_parts, sub.set_index("adsh")["period"]).reindex(res.index)
     res["shares_sec"] = cover.combine_first(wa)
+    res["shares_wa"] = wa  # 주식수 검증용(표지 값과 크게 다르면 의심)
 
     res = res.reset_index().rename(columns={"index": "adsh"})
     out = sub.merge(res, on="adsh", how="inner")
     out["cik"] = pd.to_numeric(out["cik"], errors="coerce")
     out["sic"] = pd.to_numeric(out["sic"], errors="coerce")
     out["filed"] = pd.to_datetime(out["filed"], format="%Y%m%d", errors="coerce")
-    out["capex"] = out["capex"].abs()
+    for c in ("capex", "capex1", "capex2"):
+        out[c] = out[c].abs()
     return out.drop(columns=["form"])
 
 
@@ -251,6 +259,15 @@ def compute_quality(df, tax=0.21):
     invested = df["equity"] + df["net_debt"]
     df["roic"] = np.where((df["ebit"] > 0) & (invested > 0), df["ebit"] * (1 - tax) / invested, np.nan)
     df["fcf"] = df["cfo"] - df["capex"]
+    nan = pd.Series(np.nan, index=df.index)
+    col = lambda name: df[name] if name in df.columns else nan
+    fcf_years = pd.concat([df["fcf"], col("cfo1") - col("capex1"), col("cfo2") - col("capex2")], axis=1)
+    ebit_years = pd.concat([df["ebit"], col("ebit1"), col("ebit2")], axis=1)
+    df["fcf3"] = fcf_years.mean(axis=1)            # 최근 3년(있는 해만) 평균 FCF
+    df["ebit3"] = ebit_years.mean(axis=1)          # 최근 3년(있는 해만) 평균 영업이익
+    df["n_years"] = ebit_years.notna().sum(axis=1)
+    # 보수적 FCF = min(1년 FCF, 3년 평균 FCF) - 주식 보상 비용(없으면 0)
+    df["fcf_cons"] = np.minimum(df["fcf"], df["fcf3"]) - col("sbc").fillna(0.0)
     lev_ok = (df["net_debt"] <= 0) | ((df["ebit"] > 0) & (df["net_debt"] / df["ebit"].where(df["ebit"] > 0) <= 3))
     df["quality"] = (
         (df["roic"] >= 0.12).astype(int)
@@ -275,7 +292,9 @@ def dcf_fair_price(fcf, net_debt, shares, g, r, tg):
 
 
 def add_valuation(df, prices, g=0.05, r=0.10, tg=0.03, mos_req=0.30):
-    """prices: {티커: (price, marketCap)}. 가격이 있는 종목만 남겨 가격 지표와 순위를 계산합니다."""
+    """prices: {티커: (price, marketCap)}. 가격이 있는 종목만 남겨 가격 지표와 순위를 계산합니다.
+    적정주가는 '보수적 FCF'(1년 vs 3년 평균 중 작은 값 - 주식 보상 비용)로 계산하고,
+    순위는 ROIC 순위 + 3년 평균 이익수익률 순위입니다. 데이터가 의심스러운 행은 suspect 열에 이유를 적습니다."""
     df = df.copy()
     df["price"] = df["ticker"].map(lambda t: prices.get(t, (np.nan, np.nan))[0])
     df["mcap"] = df["ticker"].map(lambda t: prices.get(t, (np.nan, np.nan))[1])
@@ -283,14 +302,21 @@ def add_valuation(df, prices, g=0.05, r=0.10, tg=0.03, mos_req=0.30):
     df = df[(df["price"] > 0) & (df["mcap"] > 0)].copy()
     if df.empty:
         return df
+    if "fcf_cons" not in df.columns:  # 이전 버전 데이터 호환
+        df["fcf_cons"] = df["fcf"]
+        df["ebit3"] = df["ebit"]
+        df["fcf3"] = df["fcf"]
+        df["n_years"] = 1
     df["shares"] = df["mcap"] / df["price"]
     df["ev"] = df["mcap"] + df["net_debt"]
     df["ey"] = np.where(df["ev"] > 0, df["ebit"] / df["ev"], np.nan)
+    df["ey3"] = np.where(df["ev"] > 0, df["ebit3"] / df["ev"], np.nan)
     df["fcfy"] = df["fcf"] / df["mcap"]
-    fair = [dcf_fair_price(a, b, c, g, r, tg) for a, b, c in zip(df["fcf"], df["net_debt"], df["shares"])]
+    df["fcfy_cons"] = df["fcf_cons"] / df["mcap"]
+    fair = [dcf_fair_price(a, b, c, g, r, tg) for a, b, c in zip(df["fcf_cons"], df["net_debt"], df["shares"])]
     df["fair"] = pd.Series(fair, index=df.index, dtype="float64")
     df["margin"] = np.where(df["fair"] > 0, (df["fair"] - df["price"]) / df["fair"], np.nan)
-    df["rank_score"] = df["roic"].rank(ascending=False) + df["ey"].rank(ascending=False)
+    df["rank_score"] = df["roic"].rank(ascending=False) + df["ey3"].rank(ascending=False)
     cheap = df["margin"] >= mos_req
     good = df["quality"] >= 4
     df["verdict"] = np.select(
@@ -298,4 +324,13 @@ def add_valuation(df, prices, g=0.05, r=0.10, tg=0.03, mos_req=0.30):
         ["✅ 후보", "👀 품질 좋음·비쌈", "⚠️ 싸지만 품질 의심"],
         default="❌ 보류",
     )
+    # --- 데이터 상식 점검 ---
+    sus = pd.Series("", index=df.index, dtype=object)
+    if "shares_wa" in df.columns:
+        ratio = df["shares"] / df["shares_wa"]
+        sus = sus.mask(ratio.notna() & ((ratio < 0.3) | (ratio > 3.0)), "주식수 불일치(표지 vs 평균주식수, 액면분할 등)")
+    sus = sus.mask((sus == "") & (df["mcap"] < 5e7), "시가총액이 비정상적으로 작음")
+    sus = sus.mask((sus == "") & (df["fcfy"].abs() > 1.0), "FCF수익률이 100% 초과(데이터 오류 의심)")
+    sus = sus.mask((sus == "") & df["fair"].notna() & (df["fair"] <= 0), "순부채가 커서 적정주가가 음수")
+    df["suspect"] = sus
     return df.sort_values("rank_score", na_position="last")
