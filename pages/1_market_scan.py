@@ -25,7 +25,7 @@ class FMPError(Exception):
 
 # ---------------- 캐시 ----------------
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
-def load_quarter(q, ua):
+def load_quarter(q, ua, ver=2):
     """분기 zip을 내려받아 10-K 숫자만 추출해 돌려줍니다 (zip은 바로 삭제)."""
     with tempfile.TemporaryDirectory() as d:
         path = sc.download_quarter(q, ua, d)
@@ -68,6 +68,34 @@ def fmp_quote(symbol, key):
     if not price or not mcap:
         return {"status": "empty"}
     return {"status": "ok", "price": float(price), "mcap": float(mcap)}
+
+
+YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StockScreenerStudy)"}
+
+
+def yahoo_price(symbol):
+    """Yahoo 공개 차트 주소에서 현재가만 가져옵니다(키 불필요). 시가총액은 주지 않으므로 SEC 표지의 주식수로 계산합니다."""
+    sym = symbol.replace(".", "-")
+    try:
+        r = requests.get(YAHOO.format(sym=sym), params={"range": "5d", "interval": "1d"},
+                         headers=YAHOO_HEADERS, timeout=20)
+    except requests.RequestException:
+        return {"status": "error"}
+    if r.status_code == 404:
+        return {"status": "empty"}
+    if r.status_code in (401, 403, 429):
+        return {"status": "blocked"}
+    if r.status_code >= 400:
+        return {"status": "error"}
+    try:
+        meta = r.json()["chart"]["result"][0]["meta"]
+        price = float(meta["regularMarketPrice"])
+    except (ValueError, KeyError, IndexError, TypeError):
+        return {"status": "empty"}
+    if price <= 0:
+        return {"status": "empty"}
+    return {"status": "ok", "price": price}
 
 
 # ---------------- 화면 ----------------
@@ -187,9 +215,13 @@ if uni is not None and not uni.empty:
     # ---- 3단계 ----
     st.header("3단계. 주가를 가져와 가격 지표와 순위 계산")
     daily_cap = st.number_input("오늘 FMP에서 쓸 최대 호출 수 (무료 한도 250회)", 10, 250, 150, 10)
+    yahoo_only = st.checkbox("FMP를 건너뛰고 Yahoo만 사용 (FMP 호출 0회)", value=False)
+    use_yahoo = st.checkbox("FMP로 안 되는 종목은 Yahoo로 보충", value=True, disabled=yahoo_only)
+    if yahoo_only:
+        use_yahoo = True
     if st.button("주가 조회 시작"):
-        if not api_key:
-            st.error("FMP API 키가 필요합니다.")
+        if not api_key and not yahoo_only:
+            st.error("FMP API 키가 필요합니다(또는 'Yahoo만 사용'을 체크하세요).")
             st.stop()
         if not ua:
             st.error("왼쪽에 SEC 요청용 이메일을 먼저 입력하세요.")
@@ -204,38 +236,76 @@ if uni is not None and not uni.empty:
         short = short.dropna(subset=["ticker"])
 
         store = quote_store()
+        sec_shares = dict(zip(short["ticker"], short["shares_sec"] if "shares_sec" in short.columns else [float("nan")] * len(short)))
         now = time.time()
         used, paid, failed, stopped = 0, [], [], None
+        y_ok, y_fail, y_streak = 0, [], 0
         bar = st.progress(0.0, text="주가 조회 중...")
         tickers = list(short["ticker"])
         for i, t in enumerate(tickers):
-            hit = store.get(t)
-            if hit and now - hit[0] < 24 * 3600:
-                res = hit[1]
-            else:
-                if used >= daily_cap:
-                    stopped = "오늘 쓸 호출 수 한도에 도달해 멈췄습니다. 내일 이어서 하거나 한도를 늘리세요."
-                    break
-                try:
-                    res = fmp_quote(t, api_key)
-                except FMPError as e:
-                    stopped = str(e)
-                    break
-                used += 1
-                store[t] = (now, res)
-            if res["status"] == "paid":
-                paid.append(t)
-            elif res["status"] != "ok":
-                failed.append(t)
+            res = {"status": "skipped"}
+            if not yahoo_only:
+                hit = store.get(t)
+                if hit and now - hit[0] < 24 * 3600:
+                    res = hit[1]
+                else:
+                    if used >= daily_cap:
+                        stopped = "오늘 쓸 FMP 호출 수 한도에 도달해 멈췄습니다. 내일 이어서 하거나 한도를 늘리세요."
+                        break
+                    try:
+                        res = fmp_quote(t, api_key)
+                    except FMPError as e:
+                        stopped = str(e)
+                        break
+                    used += 1
+                    store[t] = (now, res)
+                if res["status"] == "paid":
+                    paid.append(t)
+            if res["status"] != "ok":
+                if use_yahoo:
+                    yk = "Y:" + t
+                    yhit = store.get(yk)
+                    if yhit and now - yhit[0] < 6 * 3600:
+                        yres = yhit[1]
+                    else:
+                        yres = yahoo_price(t)
+                        time.sleep(0.25)
+                        if yres["status"] != "blocked":
+                            store[yk] = (now, yres)
+                    if yres["status"] == "blocked":
+                        y_streak += 1
+                        if y_streak >= 5:
+                            stopped = "Yahoo가 접속을 막고 있습니다(차단 또는 요청 과다). 잠시 뒤 다시 시도하세요."
+                            break
+                    else:
+                        y_streak = 0
+                    if yres["status"] == "ok" and sec_shares.get(t) and sec_shares[t] == sec_shares[t]:
+                        y_ok += 1
+                    else:
+                        y_fail.append(t)
+                elif res["status"] != "paid":
+                    failed.append(t)
             bar.progress((i + 1) / max(len(tickers), 1), text=f"{t} ({i + 1}/{len(tickers)})")
         bar.empty()
 
-        prices = {t: (v[1]["price"], v[1]["mcap"]) for t, v in store.items() if v[1].get("status") == "ok"}
+        prices = {t: (v[1]["price"], v[1]["mcap"]) for t, v in store.items()
+                  if not t.startswith("Y:") and v[1].get("status") == "ok"}
+        for t, v in store.items():
+            if t.startswith("Y:") and v[1].get("status") == "ok":
+                tk = t[2:]
+                sh = sec_shares.get(tk)
+                if tk not in prices and sh and sh == sh:
+                    prices[tk] = (v[1]["price"], v[1]["price"] * sh)
+        prices = {t: p for t, p in prices.items() if t in set(tickers)}
         out = sc.add_valuation(short, prices, g=g, r=r, tg=tg, mos_req=mos_req)
 
         msg = f"FMP 호출 {used}회 사용 · 주가를 가져온 종목 {len(out)}개"
-        if paid:
+        if y_ok:
+            msg += f" · 그중 Yahoo 보충 {y_ok}개(시가총액은 SEC 표지 주식수×주가)"
+        if paid and not y_ok:
             msg += f" · 무료 플랜에서 제외된 종목 {len(paid)}개"
+        if y_fail:
+            msg += f" · Yahoo로도 못 가져온 종목 {len(y_fail)}개"
         if no_ticker:
             msg += f" · 티커를 찾지 못한 기업 {no_ticker}개"
         st.info(msg)
@@ -265,8 +335,11 @@ if uni is not None and not uni.empty:
                 },
             )
             st.download_button("CSV로 저장", table.to_csv(index=False).encode("utf-8-sig"), "market_scan_result.csv", "text/csv")
+        if y_fail:
+            with st.expander(f"Yahoo로도 가져오지 못한 종목 {len(y_fail)}개 (주가 없음 또는 SEC 주식수 없음)"):
+                st.write(", ".join(y_fail))
         if paid:
-            with st.expander(f"무료 플랜에서 제외된 종목 {len(paid)}개"):
+            with st.expander(f"FMP 무료 플랜에서 제외된 종목 {len(paid)}개"):
                 st.write(", ".join(paid))
 
 st.divider()
