@@ -80,21 +80,21 @@ def yahoo_price(symbol):
     try:
         r = requests.get(YAHOO.format(sym=sym), params={"range": "5d", "interval": "1d"},
                          headers=YAHOO_HEADERS, timeout=20)
-    except requests.RequestException:
-        return {"status": "error"}
+    except requests.RequestException as e:
+        return {"status": "error", "why": f"네트워크 오류({type(e).__name__})"}
     if r.status_code == 404:
-        return {"status": "empty"}
+        return {"status": "empty", "why": "Yahoo에 없는 티커(404)"}
     if r.status_code in (401, 403, 429):
-        return {"status": "blocked"}
+        return {"status": "blocked", "why": f"Yahoo가 접속 거절(HTTP {r.status_code})"}
     if r.status_code >= 400:
-        return {"status": "error"}
+        return {"status": "error", "why": f"Yahoo 오류(HTTP {r.status_code})"}
     try:
         meta = r.json()["chart"]["result"][0]["meta"]
         price = float(meta["regularMarketPrice"])
     except (ValueError, KeyError, IndexError, TypeError):
-        return {"status": "empty"}
+        return {"status": "empty", "why": "Yahoo 응답에 가격 없음"}
     if price <= 0:
-        return {"status": "empty"}
+        return {"status": "empty", "why": "Yahoo 가격이 0 이하"}
     return {"status": "ok", "price": price}
 
 
@@ -240,6 +240,8 @@ if uni is not None and not uni.empty:
         now = time.time()
         used, paid, failed, stopped = 0, [], [], None
         y_ok, y_fail, y_streak = 0, [], 0
+        y_why = {}
+        n_sh = int(pd.Series(list(sec_shares.values()), dtype="float64").notna().sum())
         bar = st.progress(0.0, text="주가 조회 중...")
         tickers = list(short["ticker"])
         for i, t in enumerate(tickers):
@@ -283,6 +285,8 @@ if uni is not None and not uni.empty:
                         y_ok += 1
                     else:
                         y_fail.append(t)
+                        why = yres.get("why") if yres["status"] != "ok" else "주가는 받았으나 SEC 주식수 없음"
+                        y_why[why] = y_why.get(why, 0) + 1
                 elif res["status"] != "paid":
                     failed.append(t)
             bar.progress((i + 1) / max(len(tickers), 1), text=f"{t} ({i + 1}/{len(tickers)})")
@@ -335,6 +339,9 @@ if uni is not None and not uni.empty:
                 },
             )
             st.download_button("CSV로 저장", table.to_csv(index=False).encode("utf-8-sig"), "market_scan_result.csv", "text/csv")
+        if y_fail:
+            st.warning("Yahoo 실패 원인 집계: " + " / ".join(f"{k} {v}개" for k, v in y_why.items())
+                       + f" · SEC 주식수가 있는 후보: {n_sh}/{len(tickers)}개")
         if y_fail:
             with st.expander(f"Yahoo로도 가져오지 못한 종목 {len(y_fail)}개 (주가 없음 또는 SEC 주식수 없음)"):
                 st.write(", ".join(y_fail))
