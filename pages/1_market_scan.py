@@ -204,6 +204,10 @@ if uni is not None and not uni.empty:
     ].sort_values(["quality", "roic"], ascending=[False, False])
     st.write(f"조건에 맞는 기업: **{len(short):,}개** (이 중 상위 {min(len(short), int(max_n))}개만 주가를 조회합니다)")
     short = short.head(int(max_n)).copy()
+    if "shares_sec" in short.columns:
+        st.caption(f"SEC에서 발행주식수를 찾은 후보: {int(short['shares_sec'].notna().sum())}/{len(short)}개")
+    else:
+        st.warning("이 데이터에는 발행주식수 정보가 없습니다. 1단계에서 'SEC 데이터 불러오기'를 다시 눌러 주세요.")
 
     view = pd.DataFrame({
         "회사": short["name"], "기준일": short["period"].dt.date, "매출(백만$)": (short["rev"] / 1e6).round(0),
