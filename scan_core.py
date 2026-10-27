@@ -42,6 +42,7 @@ INSTANT_TAGS = {
     "cp": ["CommercialPaper"],
 }
 ALL_TAGS = {t for v in list(FLOW_TAGS.values()) + list(INSTANT_TAGS.values()) for t in v}
+SHARES_TAG = "EntityCommonStockSharesOutstanding"  # 10-K 표지의 발행주식수(주가 출처가 시가총액을 주지 않을 때 사용)
 
 
 def default_quarters(today=None):
@@ -97,6 +98,26 @@ def _series_for(df, tags):
     return out if out is not None else pd.Series(dtype=float)
 
 
+def _cover_shares(sh_parts):
+    """표지 발행주식수를 공시(adsh)별 1개 값으로 만듭니다. 합계 값이 있으면 그것을, 없으면 주식 종류별 값을 더합니다."""
+    if not sh_parts:
+        return pd.Series(dtype=float)
+    d = pd.concat(sh_parts, ignore_index=True)
+    if "segments" not in d.columns:
+        d["segments"] = None
+    d["value"] = pd.to_numeric(d["value"], errors="coerce")
+    d = d.dropna(subset=["value"])
+    d = d[d["value"] > 0]
+    if d.empty:
+        return pd.Series(dtype=float)
+    d["ddate"] = pd.to_datetime(d["ddate"], format="%Y%m%d", errors="coerce")
+    d = d.dropna(subset=["ddate"])
+    d = d[d["ddate"] == d.groupby("adsh")["ddate"].transform("max")]
+    total = d[d["segments"].isna()].drop_duplicates("adsh").set_index("adsh")["value"]
+    parts = d[d["segments"].notna()].drop_duplicates(["adsh", "segments"]).groupby("adsh")["value"].sum()
+    return total.combine_first(parts)
+
+
 def extract_quarter(zip_path, forms=("10-K",)):
     """분기 zip 하나에서 10-K 공시별 핵심 재무 숫자를 뽑아 DataFrame(공시 1건=1행)으로 돌려줍니다."""
     with zipfile.ZipFile(zip_path) as z:
@@ -114,12 +135,20 @@ def extract_quarter(zip_path, forms=("10-K",)):
         adsh_set = set(sub["adsh"])
 
         parts = []
+        sh_parts = []
         with z.open(names["num.txt"]) as f:
             reader = pd.read_csv(
                 f, sep="\t", dtype=str, chunksize=500_000,
                 usecols=lambda c: c in {"adsh", "tag", "ddate", "qtrs", "uom", "segments", "coreg", "value"},
             )
             for chunk in reader:
+                msh = chunk["adsh"].isin(adsh_set) & (chunk["tag"] == SHARES_TAG) & (chunk["uom"] == "shares")
+                if msh.any():
+                    shc = chunk[msh]
+                    if "coreg" in shc.columns:
+                        shc = shc[shc["coreg"].isna()]
+                    cols = [c for c in ["adsh", "ddate", "segments", "value"] if c in shc.columns]
+                    sh_parts.append(shc[cols])
                 m = chunk["adsh"].isin(adsh_set) & chunk["tag"].isin(ALL_TAGS) & (chunk["uom"] == "USD")
                 chunk = chunk[m]
                 if "segments" in chunk.columns:
@@ -155,6 +184,8 @@ def extract_quarter(zip_path, forms=("10-K",)):
     base = inst["debt_total"].reindex(res.index)
     base = base.where(base.notna(), inst["debt_lt"].reindex(res.index).fillna(0) + inst["debt_cur"].reindex(res.index).fillna(0))
     res["debt"] = base + inst["stb"].reindex(res.index).fillna(0) + inst["cp"].reindex(res.index).fillna(0)
+
+    res["shares_sec"] = _cover_shares(sh_parts).reindex(res.index)
 
     res = res.reset_index().rename(columns={"index": "adsh"})
     out = sub.merge(res, on="adsh", how="inner")
