@@ -205,7 +205,7 @@ if uni is not None and not uni.empty:
     min_rev = c1.number_input("최소 매출 (백만 달러)", 0, 1_000_000, 1000, 100)
     min_roic = c2.number_input("최소 ROIC (%)", 0.0, 200.0, 15.0, 1.0) / 100
     min_q = c3.number_input("최소 품질 점수 (5점)", 0, 5, 4, 1)
-    max_n = c4.number_input("주가를 조회할 최대 종목 수", 1, 240, 100, 10)
+    max_n = c4.number_input("주가를 조회할 최대 종목 수", 1, 3000, 100, 10)
 
     short = uni[
         (uni["rev"] >= min_rev * 1e6)
