@@ -25,7 +25,7 @@ class FMPError(Exception):
 
 # ---------------- 캐시 ----------------
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
-def load_quarter(q, ua, ver=2):
+def load_quarter(q, ua, ver=3):
     """분기 zip을 내려받아 10-K 숫자만 추출해 돌려줍니다 (zip은 바로 삭제)."""
     with tempfile.TemporaryDirectory() as d:
         path = sc.download_quarter(q, ua, d)
@@ -174,6 +174,11 @@ if st.button("SEC 데이터 불러오기", type="primary"):
     bar.empty()
     for p in problems:
         st.warning(p)
+    raw = [f for f in frames if f is not None and len(f)]
+    if raw:
+        allf = pd.concat(raw, ignore_index=True)
+        has_col = "shares_sec" in allf.columns
+        st.session_state["shares_stat"] = (len(allf), int(allf["shares_sec"].notna().sum()) if has_col else -1)
     uni = sc.build_universe(frames, tax=tax)
     if uni.empty:
         st.error("사용할 수 있는 데이터가 없습니다. 위의 경고 문구를 알려주세요.")
@@ -182,6 +187,12 @@ if st.button("SEC 데이터 불러오기", type="primary"):
         st.session_state["quarters_used"] = qs
 
 uni = st.session_state.get("universe")
+stat = st.session_state.get("shares_stat")
+if stat:
+    if stat[1] < 0:
+        st.warning("불러온 데이터에 발행주식수 칸이 없습니다(오래된 캐시). 앱을 Reboot한 뒤 다시 불러오세요.")
+    else:
+        st.caption(f"진단: 10-K 공시 {stat[0]:,}건 중 발행주식수를 찾은 공시 {stat[1]:,}건")
 if uni is not None and not uni.empty:
     st.success(
         f"{len(uni):,}개 기업의 최신 10-K 숫자를 불러왔습니다 "
