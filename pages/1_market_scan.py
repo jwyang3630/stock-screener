@@ -25,7 +25,7 @@ class FMPError(Exception):
 
 # ---------------- 캐시 ----------------
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
-def load_quarter(q, ua, ver=3):
+def load_quarter(q, ua, ver=4):
     """분기 zip을 내려받아 10-K 숫자만 추출해 돌려줍니다 (zip은 바로 삭제)."""
     with tempfile.TemporaryDirectory() as d:
         path = sc.download_quarter(q, ua, d)
@@ -330,23 +330,33 @@ if uni is not None and not uni.empty:
         st.info(msg)
         if stopped:
             st.warning(stopped)
+        bad = out.iloc[0:0]
         if out.empty:
             st.error("주가를 가져온 종목이 없습니다.")
         else:
+            bad = out[out["suspect"] != ""]
+            out = out[out["suspect"] == ""]
+        if not out.empty:
             table = pd.DataFrame({
                 "티커": out["ticker"], "회사": out["name"], "판정": out["verdict"], "품질(5)": out["quality"],
-                "ROIC(%)": out["roic"] * 100, "이익수익률(%)": out["ey"] * 100, "FCF수익률(%)": out["fcfy"] * 100,
+                "ROIC(%)": out["roic"] * 100,
+                "이익수익률 3년평균(%)": out["ey3"] * 100, "이익수익률 1년(%)": out["ey"] * 100,
+                "FCF수익률 보수(%)": out["fcfy_cons"] * 100, "FCF수익률 1년(%)": out["fcfy"] * 100,
                 "안전마진(%)": out["margin"] * 100, "현재가": out["price"], "적정주가": out["fair"],
-                "순위점수": out["rank_score"], "기준일": out["period"].dt.date,
+                "순위점수": out["rank_score"], "사용 연수": out["n_years"], "기준일": out["period"].dt.date,
             }).reset_index(drop=True)
             table.index = table.index + 1
-            st.subheader("결과 (마법공식 순위: ROIC 순위 + 이익수익률 순위, 낮을수록 위)")
+            st.subheader("결과 (순위 = ROIC 순위 + 3년 평균 이익수익률 순위, 낮을수록 위)")
+            st.caption("적정주가·안전마진은 '보수적 FCF'(1년 FCF와 3년 평균 FCF 중 작은 값에서 주식 보상 비용을 뺀 값)로 계산합니다. "
+                       "'사용 연수'는 평균에 쓴 연도 수입니다(소규모 기업은 2년치만 공시).")
             st.dataframe(
                 table, use_container_width=True,
                 column_config={
                     "ROIC(%)": st.column_config.NumberColumn(format="%.1f"),
-                    "이익수익률(%)": st.column_config.NumberColumn(format="%.1f"),
-                    "FCF수익률(%)": st.column_config.NumberColumn(format="%.1f"),
+                    "이익수익률 3년평균(%)": st.column_config.NumberColumn(format="%.1f"),
+                    "이익수익률 1년(%)": st.column_config.NumberColumn(format="%.1f"),
+                    "FCF수익률 보수(%)": st.column_config.NumberColumn(format="%.1f"),
+                    "FCF수익률 1년(%)": st.column_config.NumberColumn(format="%.1f"),
                     "안전마진(%)": st.column_config.NumberColumn(format="%.1f"),
                     "현재가": st.column_config.NumberColumn(format="%.2f"),
                     "적정주가": st.column_config.NumberColumn(format="%.2f"),
@@ -354,6 +364,10 @@ if uni is not None and not uni.empty:
                 },
             )
             st.download_button("CSV로 저장", table.to_csv(index=False).encode("utf-8-sig"), "market_scan_result.csv", "text/csv")
+        if len(bad):
+            with st.expander(f"데이터 의심으로 순위에서 제외한 종목 {len(bad)}개"):
+                st.dataframe(pd.DataFrame({"티커": bad["ticker"], "회사": bad["name"], "이유": bad["suspect"]}),
+                             use_container_width=True, hide_index=True)
         if y_fail:
             st.warning("Yahoo 실패 원인 집계: " + " / ".join(f"{k} {v}개" for k, v in y_why.items())
                        + f" · SEC 주식수가 있는 후보: {n_sh}/{len(tickers)}개")
