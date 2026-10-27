@@ -43,6 +43,11 @@ INSTANT_TAGS = {
 }
 ALL_TAGS = {t for v in list(FLOW_TAGS.values()) + list(INSTANT_TAGS.values()) for t in v}
 SHARES_TAG = "EntityCommonStockSharesOutstanding"  # 10-K 표지의 발행주식수(주가 출처가 시가총액을 주지 않을 때 사용)
+WA_SHARES_TAGS = [  # 표지 값이 없을 때 대신 쓰는 1년 평균 발행주식수(손익계산서)
+    "WeightedAverageNumberOfDilutedSharesOutstanding",
+    "WeightedAverageNumberOfSharesOutstandingBasic",
+]
+SHARES_TAGS = {SHARES_TAG, *WA_SHARES_TAGS}
 
 
 def default_quarters(today=None):
@@ -103,6 +108,8 @@ def _cover_shares(sh_parts):
     if not sh_parts:
         return pd.Series(dtype=float)
     d = pd.concat(sh_parts, ignore_index=True)
+    if "tag" in d.columns:
+        d = d[d["tag"] == SHARES_TAG]
     if "segments" not in d.columns:
         d["segments"] = None
     d["value"] = pd.to_numeric(d["value"], errors="coerce")
@@ -116,6 +123,29 @@ def _cover_shares(sh_parts):
     total = d[d["segments"].isna()].drop_duplicates("adsh").set_index("adsh")["value"]
     parts = d[d["segments"].notna()].drop_duplicates(["adsh", "segments"]).groupby("adsh")["value"].sum()
     return total.combine_first(parts)
+
+
+def _wa_shares(sh_parts, period_by_adsh):
+    """표지 값이 없을 때 쓸 대체값: 해당 회계연도(qtrs=4)의 희석 평균 발행주식수(없으면 기본 평균)."""
+    if not sh_parts:
+        return pd.Series(dtype=float)
+    d = pd.concat(sh_parts, ignore_index=True)
+    if not {"tag", "qtrs"}.issubset(d.columns):
+        return pd.Series(dtype=float)
+    if "segments" in d.columns:
+        d = d[d["segments"].isna()]
+    d = d[d["tag"].isin(WA_SHARES_TAGS)].copy()
+    d["value"] = pd.to_numeric(d["value"], errors="coerce")
+    d["qtrs"] = pd.to_numeric(d["qtrs"], errors="coerce")
+    d["ddate"] = pd.to_datetime(d["ddate"], format="%Y%m%d", errors="coerce")
+    d = d.dropna(subset=["value", "qtrs", "ddate"])
+    d = d[(d["value"] > 0) & (d["qtrs"] == 4)]
+    d = d[d["ddate"] == d["adsh"].map(period_by_adsh)]
+    out = None
+    for t in WA_SHARES_TAGS:
+        x = d[d["tag"] == t].drop_duplicates("adsh").set_index("adsh")["value"]
+        out = x if out is None else out.combine_first(x)
+    return out if out is not None else pd.Series(dtype=float)
 
 
 def extract_quarter(zip_path, forms=("10-K",)):
@@ -142,12 +172,12 @@ def extract_quarter(zip_path, forms=("10-K",)):
                 usecols=lambda c: c in {"adsh", "tag", "ddate", "qtrs", "uom", "segments", "coreg", "value"},
             )
             for chunk in reader:
-                msh = chunk["adsh"].isin(adsh_set) & (chunk["tag"] == SHARES_TAG) & (chunk["uom"] == "shares")
+                msh = chunk["adsh"].isin(adsh_set) & chunk["tag"].isin(SHARES_TAGS) & (chunk["uom"] == "shares")
                 if msh.any():
                     shc = chunk[msh]
                     if "coreg" in shc.columns:
                         shc = shc[shc["coreg"].isna()]
-                    cols = [c for c in ["adsh", "ddate", "segments", "value"] if c in shc.columns]
+                    cols = [c for c in ["adsh", "tag", "ddate", "qtrs", "segments", "value"] if c in shc.columns]
                     sh_parts.append(shc[cols])
                 m = chunk["adsh"].isin(adsh_set) & chunk["tag"].isin(ALL_TAGS) & (chunk["uom"] == "USD")
                 chunk = chunk[m]
@@ -185,7 +215,9 @@ def extract_quarter(zip_path, forms=("10-K",)):
     base = base.where(base.notna(), inst["debt_lt"].reindex(res.index).fillna(0) + inst["debt_cur"].reindex(res.index).fillna(0))
     res["debt"] = base + inst["stb"].reindex(res.index).fillna(0) + inst["cp"].reindex(res.index).fillna(0)
 
-    res["shares_sec"] = _cover_shares(sh_parts).reindex(res.index)
+    cover = _cover_shares(sh_parts).reindex(res.index)
+    wa = _wa_shares(sh_parts, sub.set_index("adsh")["period"]).reindex(res.index)
+    res["shares_sec"] = cover.combine_first(wa)
 
     res = res.reset_index().rename(columns={"index": "adsh"})
     out = sub.merge(res, on="adsh", how="inner")
