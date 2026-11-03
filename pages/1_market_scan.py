@@ -67,7 +67,8 @@ def fmp_quote(symbol, key):
     price, mcap = q.get("price"), q.get("marketCap")
     if not price or not mcap:
         return {"status": "empty"}
-    return {"status": "ok", "price": float(price), "mcap": float(mcap)}
+    hi = q.get("yearHigh")
+    return {"status": "ok", "price": float(price), "mcap": float(mcap), "high": float(hi) if hi else None}
 
 
 YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
@@ -78,7 +79,7 @@ def yahoo_price(symbol):
     """Yahoo 공개 차트 주소에서 현재가만 가져옵니다(키 불필요). 시가총액은 주지 않으므로 SEC 표지의 주식수로 계산합니다."""
     sym = symbol.replace(".", "-")
     try:
-        r = requests.get(YAHOO.format(sym=sym), params={"range": "5d", "interval": "1d"},
+        r = requests.get(YAHOO.format(sym=sym), params={"range": "1y", "interval": "1wk"},
                          headers=YAHOO_HEADERS, timeout=20)
     except requests.RequestException as e:
         return {"status": "error", "why": f"네트워크 오류({type(e).__name__})"}
@@ -95,7 +96,14 @@ def yahoo_price(symbol):
         return {"status": "empty", "why": "Yahoo 응답에 가격 없음"}
     if price <= 0:
         return {"status": "empty", "why": "Yahoo 가격이 0 이하"}
-    return {"status": "ok", "price": price}
+    high = meta.get("fiftyTwoWeekHigh")
+    if not high:
+        try:
+            hs = [x for x in r.json()["chart"]["result"][0]["indicators"]["quote"][0]["high"] if x]
+            high = max(hs) if hs else None
+        except (ValueError, KeyError, IndexError, TypeError):
+            high = None
+    return {"status": "ok", "price": price, "high": float(high) if high else None}
 
 
 # ---------------- 화면 ----------------
@@ -126,6 +134,7 @@ with st.sidebar:
     r = st.number_input("할인율 (%)", 1.0, 30.0, 10.0, 0.5) / 100
     tg = st.number_input("영구 성장률 (%)", 0.0, 6.0, 3.0, 0.5) / 100
     mos_req = st.number_input("요구 안전마진 (%)", 0.0, 90.0, 30.0, 5.0) / 100
+    dd_req = st.number_input("'싸졌다'로 볼 52주 고점 대비 하락 (%)", 5.0, 90.0, 25.0, 5.0) / 100
     if r <= tg:
         st.error("할인율은 영구 성장률보다 커야 합니다")
 
@@ -282,7 +291,7 @@ if uni is not None and not uni.empty:
                 if use_yahoo:
                     yk = "Y:" + t
                     yhit = store.get(yk)
-                    if yhit and now - yhit[0] < 6 * 3600:
+                    if yhit and now - yhit[0] < 6 * 3600 and (yhit[1].get("status") != "ok" or "high" in yhit[1]):
                         yres = yhit[1]
                     else:
                         yres = yahoo_price(t)
@@ -316,7 +325,12 @@ if uni is not None and not uni.empty:
                 if tk not in prices and sh and sh == sh:
                     prices[tk] = (v[1]["price"], v[1]["price"] * sh)
         prices = {t: p for t, p in prices.items() if t in set(tickers)}
-        out = sc.add_valuation(short, prices, g=g, r=r, tg=tg, mos_req=mos_req)
+        highs = {}
+        for t, v in store.items():
+            tk = t[2:] if t.startswith("Y:") else t
+            if v[1].get("status") == "ok" and v[1].get("high") and tk not in highs:
+                highs[tk] = v[1]["high"]
+        out = sc.add_valuation(short, prices, g=g, r=r, tg=tg, mos_req=mos_req, highs=highs, dd_req=dd_req)
 
         msg = f"FMP 호출 {used}회 사용 · 주가를 가져온 종목 {len(out)}개"
         if y_ok:
@@ -338,7 +352,8 @@ if uni is not None and not uni.empty:
             out = out[out["suspect"] == ""]
         if not out.empty:
             table = pd.DataFrame({
-                "티커": out["ticker"], "회사": out["name"], "판정": out["verdict"], "품질(5)": out["quality"],
+                "티커": out["ticker"], "회사": out["name"], "분류": out["category"], "판정": out["verdict"],
+                "품질(5)": out["quality"], "추세": out["trend"], "52주 고점 대비(%)": out["dd"] * 100,
                 "ROIC(%)": out["roic"] * 100,
                 "이익수익률 3년평균(%)": out["ey3"] * 100, "이익수익률 1년(%)": out["ey"] * 100,
                 "FCF수익률 보수(%)": out["fcfy_cons"] * 100, "FCF수익률 1년(%)": out["fcfy"] * 100,
@@ -347,11 +362,15 @@ if uni is not None and not uni.empty:
             }).reset_index(drop=True)
             table.index = table.index + 1
             st.subheader("결과 (순위 = ROIC 순위 + 3년 평균 이익수익률 순위, 낮을수록 위)")
+            st.caption("**분류** — ⭐ 좋은 회사가 싸짐: 품질 4점 이상 + 추세 유지·개선 + 52주 고점 대비 크게 하락 + 안전마진 충족 / "
+                       "💎 원래 싼 편: 같은 조건이지만 최근 하락은 없음 / 📉 하락했지만 아직 비쌈 / ⚠️ 가치 함정 의심: 사업 숫자 악화 + 하락 + 싸 보임. "
+                       "추세는 마지막 연간 보고서 기준이라 그 이후 분기의 악화는 반영하지 못합니다.")
             st.caption("적정주가·안전마진은 '보수적 FCF'(1년 FCF와 3년 평균 FCF 중 작은 값에서 주식 보상 비용을 뺀 값)로 계산합니다. "
                        "'사용 연수'는 평균에 쓴 연도 수입니다(소규모 기업은 2년치만 공시).")
             st.dataframe(
                 table, use_container_width=True,
                 column_config={
+                    "52주 고점 대비(%)": st.column_config.NumberColumn(format="%.1f"),
                     "ROIC(%)": st.column_config.NumberColumn(format="%.1f"),
                     "이익수익률 3년평균(%)": st.column_config.NumberColumn(format="%.1f"),
                     "이익수익률 1년(%)": st.column_config.NumberColumn(format="%.1f"),
