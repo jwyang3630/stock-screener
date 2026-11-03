@@ -268,6 +268,17 @@ def compute_quality(df, tax=0.21):
     df["n_years"] = ebit_years.notna().sum(axis=1)
     # 보수적 FCF = min(1년 FCF, 3년 평균 FCF) - 주식 보상 비용(없으면 0)
     df["fcf_cons"] = np.minimum(df["fcf"], df["fcf3"]) - col("sbc").fillna(0.0)
+    # 추세: 최근 연도가 그 이전 연도 평균보다 나빠졌는가 (연간 보고서만 쓰므로 회계연도 이후의 변화는 못 봄)
+    prior_ebit = pd.concat([col("ebit1"), col("ebit2")], axis=1).mean(axis=1)
+    fcf_p = pd.concat([col("cfo1") - col("capex1"), col("cfo2") - col("capex2")], axis=1).mean(axis=1)
+    ebit_tr = pd.Series(np.where(prior_ebit > 0, df["ebit"] / prior_ebit - 1, np.where(df["ebit"] > 0, 1.0, np.nan)), index=df.index)
+    fcf_tr = pd.Series(np.where(fcf_p > 0, df["fcf"] / fcf_p - 1, np.where(df["fcf"] > 0, 1.0, np.nan)), index=df.index)
+    df["ebit_trend"] = ebit_tr
+    df["fcf_trend"] = fcf_tr
+    rev_down = df["rev"] < df["revp"] * 0.98
+    bad = (ebit_tr < -0.10) | (fcf_tr < -0.15) | rev_down
+    known = ebit_tr.notna() | fcf_tr.notna()
+    df["trend"] = np.select([bad, known], ["악화", "유지·개선"], default="판단불가")
     lev_ok = (df["net_debt"] <= 0) | ((df["ebit"] > 0) & (df["net_debt"] / df["ebit"].where(df["ebit"] > 0) <= 3))
     df["quality"] = (
         (df["roic"] >= 0.12).astype(int)
@@ -291,7 +302,7 @@ def dcf_fair_price(fcf, net_debt, shares, g, r, tg):
     return (pv - net_debt) / shares
 
 
-def add_valuation(df, prices, g=0.05, r=0.10, tg=0.03, mos_req=0.30):
+def add_valuation(df, prices, g=0.05, r=0.10, tg=0.03, mos_req=0.30, highs=None, dd_req=0.25):
     """prices: {티커: (price, marketCap)}. 가격이 있는 종목만 남겨 가격 지표와 순위를 계산합니다.
     적정주가는 '보수적 FCF'(1년 vs 3년 평균 중 작은 값 - 주식 보상 비용)로 계산하고,
     순위는 ROIC 순위 + 3년 평균 이익수익률 순위입니다. 데이터가 의심스러운 행은 suspect 열에 이유를 적습니다."""
@@ -333,4 +344,21 @@ def add_valuation(df, prices, g=0.05, r=0.10, tg=0.03, mos_req=0.30):
     sus = sus.mask((sus == "") & (df["fcfy"].abs() > 1.0), "FCF수익률이 100% 초과(데이터 오류 의심)")
     sus = sus.mask((sus == "") & df["fair"].notna() & (df["fair"] <= 0), "순부채가 커서 적정주가가 음수")
     df["suspect"] = sus
-    return df.sort_values("rank_score", na_position="last")
+    # --- 52주 고점 대비 하락과 분류 ---
+    highs = highs or {}
+    df["high52"] = df["ticker"].map(lambda t: highs.get(t, np.nan))
+    df["dd"] = np.where(df["high52"] > 0, np.minimum(df["price"] / df["high52"] - 1, 0.0), np.nan)
+    if "trend" not in df.columns:
+        df["trend"] = "판단불가"
+    good = (df["quality"] >= 4) & (df["trend"] == "유지·개선")
+    fell = df["dd"] <= -dd_req
+    cheap_v = df["margin"] >= mos_req
+    df["category"] = np.select(
+        [good & fell & cheap_v, good & cheap_v & ~fell, good & fell & ~cheap_v, (df["trend"] == "악화") & fell & cheap_v],
+        ["⭐ 좋은 회사가 싸짐", "💎 원래 싼 편", "📉 하락했지만 아직 비쌈", "⚠️ 가치 함정 의심"],
+        default="—",
+    )
+    order = {"⭐ 좋은 회사가 싸짐": 0, "💎 원래 싼 편": 1, "📉 하락했지만 아직 비쌈": 2, "⚠️ 가치 함정 의심": 3, "—": 4}
+    df["_cat_order"] = df["category"].map(order)
+    df = df.sort_values(["_cat_order", "rank_score"], na_position="last").drop(columns="_cat_order")
+    return df
